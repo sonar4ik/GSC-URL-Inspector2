@@ -1,63 +1,129 @@
-const SHEET_NAME_QUICK_CHECK = 'Quick Check';
-const SHEET_NAME_SETTINGS = 'Settings';
-const SHEET_NAME_LOGS = 'Logs';
-
-const QUICK_CHECK_HEADERS = ['URL', 'Result', 'IndexingState', 'CoverageState', 'LastCrawlTime', 'RobotsTxtState', 'PageFetchState', 'MobileUsability', 'CanonicalUrl', 'InspectionTime', 'Error'];
-const SETTINGS_HEADERS = ['Key', 'Value'];
-const LOGS_HEADERS = ['Timestamp', 'Type', 'Message', 'Details'];
-
 const URL_INSPECTION_ENDPOINT = 'https://searchconsole.googleapis.com/v1/urlInspection/index:inspect';
 
-function executeQuickCheck() {
-  runInspection(false);
+function executeQuickCheck(mode) {
+  return runInspection('quick', mode || 'new');
 }
 
-function executeFullInspection() {
-  runInspection(true);
+function executeFullInspection(mode) {
+  return runInspection('full', mode || 'all');
 }
 
-function runInspection(full) {
+function checkForUpdates() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(SHEET_NAME_QUICK_CHECK);
-  if (!sheet) {
+  var sheet = ss.getSheetByName('Logs');
+  if (sheet) {
+    sheet.appendRow([new Date(), 'INFO', 'CheckForUpdates', 'No remote update logic implemented yet']);
+  }
+  return 'Current code version: 1.0.0';
+}
+
+function runInspection(type, mode) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var quickSheet = ss.getSheetByName('Quick Check');
+  var settingsSheet = ss.getSheetByName('Settings');
+  var logSheet = ss.getSheetByName('Logs');
+  if (!quickSheet) {
     throw new Error('Quick Check sheet not found');
   }
-  var lastRow = sheet.getLastRow();
-  if (lastRow < 2) {
-    SpreadsheetApp.getUi().alert('No URLs found in Quick Check sheet.');
-    return;
+  if (!settingsSheet) {
+    throw new Error('Settings sheet not found');
   }
-  var siteUrl = getSetting('siteUrl');
+  var settings = getSettingsMap(settingsSheet);
+  var siteUrl = settings.siteUrl;
   if (!siteUrl) {
-    SpreadsheetApp.getUi().alert('Please set siteUrl in Settings sheet (Key=siteUrl, Value=your Search Console property).');
-    throw new Error('Missing siteUrl setting');
+    throw new Error('Settings: siteUrl is empty');
   }
-  var range = sheet.getRange(2, 1, lastRow - 1, 1);
+  var maxRequestsPerRun = parseInt(settings.maxRequestsPerRun || '100', 10);
+  if (isNaN(maxRequestsPerRun) || maxRequestsPerRun <= 0) {
+    maxRequestsPerRun = 100;
+  }
+  var delayMs = parseInt(settings.delayMs || '1100', 10);
+  if (isNaN(delayMs) || delayMs < 0) {
+    delayMs = 1100;
+  }
+  var lastRow = quickSheet.getLastRow();
+  if (lastRow < 2) {
+    return 'No URLs in Quick Check sheet';
+  }
+  var range = quickSheet.getRange(2, 1, lastRow - 1, 11);
   var values = range.getValues();
+  var props = PropertiesService.getScriptProperties();
+  props.deleteProperty('stopRequested');
+  var processed = 0;
+  var inspectedRows = 0;
   for (var i = 0; i < values.length; i++) {
     var rowIndex = i + 2;
-    var url = values[i][0];
+    var row = values[i];
+    var url = row[0];
+    var resultValue = row[1];
+    var errorValue = row[10];
     if (!url) {
       continue;
     }
-    var existingResult = sheet.getRange(rowIndex, 2).getValue();
-    if (!full && existingResult) {
+    if (!shouldProcessRowForMode(mode, resultValue, errorValue)) {
       continue;
     }
-    var result;
-    try {
-      result = inspectSingleUrl(url, siteUrl);
-      writeInspectionResult(sheet, rowIndex, url, result);
-      appendLog('INFO', 'Inspection', 'OK for ' + url);
-    } catch (e) {
-      writeErrorResult(sheet, rowIndex, url, e);
-      appendLog('ERROR', 'Inspection', 'Failed for ' + url + ': ' + e.message);
+    var stopFlag = props.getProperty('stopRequested');
+    if (stopFlag === '1') {
+      appendLog(logSheet, 'INFO', 'Stop', 'Stop requested by user');
+      break;
     }
-    Utilities.sleep(1100);
+    if (processed >= maxRequestsPerRun) {
+      appendLog(logSheet, 'INFO', 'Limit', 'Reached maxRequestsPerRun: ' + maxRequestsPerRun);
+      break;
+    }
+    inspectedRows++;
+    try {
+      var inspectionResult = callUrlInspectionApi(url, siteUrl);
+      writeSuccessRow(quickSheet, rowIndex, inspectionResult);
+      appendLog(logSheet, 'INFO', 'Inspection', 'OK ' + url);
+    } catch (e) {
+      writeErrorRow(quickSheet, rowIndex, e);
+      appendLog(logSheet, 'ERROR', 'Inspection', 'Failed ' + url + ' ' + e.message);
+    }
+    processed++;
+    if (delayMs > 0) {
+      Utilities.sleep(delayMs);
+    }
   }
+  if (inspectedRows === 0) {
+    return 'No rows matched mode "' + mode + '"';
+  }
+  return 'Processed ' + processed + ' URLs in mode "' + mode + '"';
 }
 
-function inspectSingleUrl(inspectionUrl, siteUrl) {
+function shouldProcessRowForMode(mode, resultValue, errorValue) {
+  if (mode === 'all') {
+    return true;
+  }
+  if (mode === 'new' || mode === 'empty') {
+    return !resultValue;
+  }
+  if (mode === 'errors') {
+    return resultValue === 'ERROR' || !!errorValue;
+  }
+  return true;
+}
+
+function getSettingsMap(sheet) {
+  var map = {};
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    return map;
+  }
+  var range = sheet.getRange(2, 1, lastRow - 1, 3);
+  var values = range.getValues();
+  for (var i = 0; i < values.length; i++) {
+    var key = values[i][0];
+    var value = values[i][2];
+    if (key) {
+      map[key] = value;
+    }
+  }
+  return map;
+}
+
+function callUrlInspectionApi(inspectionUrl, siteUrl) {
   var payload = {
     inspectionUrl: inspectionUrl,
     siteUrl: siteUrl,
@@ -85,7 +151,7 @@ function inspectSingleUrl(inspectionUrl, siteUrl) {
   return data.inspectionResult;
 }
 
-function writeInspectionResult(sheet, rowIndex, url, inspectionResult) {
+function writeSuccessRow(sheet, rowIndex, inspectionResult) {
   var indexStatus = inspectionResult.indexStatusResult || {};
   var mobile = inspectionResult.mobileUsabilityResult || {};
   var indexingState = indexStatus.indexingState || '';
@@ -112,48 +178,27 @@ function writeInspectionResult(sheet, rowIndex, url, inspectionResult) {
   sheet.getRange(rowIndex, 2, 1, rowValues.length).setValues([rowValues]);
 }
 
-function writeErrorResult(sheet, rowIndex, url, error) {
-  var existing = sheet.getRange(rowIndex, 1, 1, QUICK_CHECK_HEADERS.length).getValues()[0];
-  var rowValues = existing;
-  rowValues[1] = 'ERROR';
-  rowValues[2] = '';
-  rowValues[3] = '';
-  rowValues[4] = '';
-  rowValues[5] = '';
-  rowValues[6] = '';
-  rowValues[7] = '';
-  rowValues[8] = '';
-  rowValues[9] = new Date();
-  rowValues[10] = error.message;
-  sheet.getRange(rowIndex, 1, 1, rowValues.length).setValues([rowValues]);
+function writeErrorRow(sheet, rowIndex, error) {
+  var inspectionTime = new Date();
+  var rowValues = [
+    'ERROR',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    inspectionTime,
+    error.message || String(error)
+  ];
+  sheet.getRange(rowIndex, 2, 1, rowValues.length).setValues([rowValues]);
 }
 
-function getSetting(key) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(SHEET_NAME_SETTINGS);
-  if (!sheet) {
-    return null;
-  }
-  var lastRow = sheet.getLastRow();
-  if (lastRow < 2) {
-    return null;
-  }
-  var range = sheet.getRange(2, 1, lastRow - 1, 2);
-  var values = range.getValues();
-  for (var i = 0; i < values.length; i++) {
-    if (values[i][0] === key) {
-      return values[i][1];
-    }
-  }
-  return null;
-}
-
-function appendLog(type, message, details) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(SHEET_NAME_LOGS);
-  if (!sheet) {
+function appendLog(logSheet, type, message, details) {
+  if (!logSheet) {
     return;
   }
   var row = [new Date(), type, message, details || ''];
-  sheet.appendRow(row);
+  logSheet.appendRow(row);
 }
